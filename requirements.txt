@@ -1,0 +1,10 @@
+# ADEnumToolkit Python dependencies
+#
+# impacket provides the LDAP client and the GetUserSPNs / GetNPUsers example
+# scripts used for Kerberoasting and AS-REP roasting.
+impacket>=0.11.0
+
+# netexec (nxc) is an external CLI tool, NOT a pip dependency of this project.
+# Install it separately, e.g.:
+#   pipx install netexec
+# Project: https://github.com/Pennyw0rth/NetExec
