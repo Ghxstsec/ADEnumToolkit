@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -823,17 +824,26 @@ def parse_shares(output: str) -> None:
 
 
 def parse_userlist(output: str, label: str, ref: str) -> int:
-    """Count user rows in netexec --users / --rid-brute output."""
+    """Extract account names from netexec --users / --rid-brute output."""
     users: list[str] = []
     for ln in _lines(output):
         low = ln.lower()
-        if "sidtypeuser" in low or ("-username-" in low):
+        # --- RID-brute rows: "RID: DOMAIN\Name (SidTypeUser)" ---------------- #
+        # Only SidTypeUser entries are accounts; SidTypeGroup/Alias/etc. are not.
+        if "sidtype" in low:
+            m = re.search(r"\\(.+?)\s*\(SidTypeUser\)\s*$", ln)
+            if m:
+                users.append(m.group(1).strip())
             continue
-        # netexec prints "DOMAIN\\user" rows; capture those.
-        if "\\" in ln and "smb" in low:
-            frag = ln.split("\\", 1)[1].split()[0]
-            if frag and frag.lower() not in ("name", "username"):
-                users.append(frag)
+        # --- --users table rows: SMB <ip> <port> <HOST> <User> <pwset> ... --- #
+        # Skip status/summary/header lines; the username is the 5th column.
+        if any(tag in ln for tag in ("[+]", "[-]", "[*]")) or "-username-" in low:
+            continue
+        toks = ln.split()
+        if len(toks) >= 5 and toks[0].upper() == "SMB" and toks[2].isdigit():
+            name = toks[4]
+            if name and name.lower() not in ("name", "username"):
+                users.append(name)
     users = sorted(set(users))
     if users:
         REPORT.add_f(
@@ -843,6 +853,30 @@ def parse_userlist(output: str, label: str, ref: str) -> int:
             ref=ref,
         )
     return len(users)
+
+
+def parse_grouplist(output: str) -> int:
+    """Extract group names from netexec `ldap --groups` output."""
+    groups: list[str] = []
+    for ln in _lines(output):
+        if any(tag in ln for tag in ("[+]", "[-]", "[*]")):
+            continue
+        toks = ln.split()
+        if len(toks) >= 5 and toks[0].upper() == "LDAP" and toks[2].isdigit():
+            # Rows read "LDAP <ip> <port> <HOST> <group name>  membercount: N".
+            rest = " ".join(toks[4:])
+            name = re.split(r"\s+membercount:", rest, maxsplit=1)[0].strip()
+            if name and name.lower() not in ("name", "groupname"):
+                groups.append(name)
+    groups = sorted(set(groups))
+    if groups:
+        REPORT.add_f(
+            "Groups", Sev.INFO, f"{len(groups)} domain group(s) enumerated via LDAP",
+            details=groups[:40] + (["..."] if len(groups) > 40 else []),
+            explanation="Cross-reference privileged group membership with your user list.",
+            ref=REFS["ldap"],
+        )
+    return len(groups)
 
 
 def parse_passpol(output: str) -> None:
@@ -1216,17 +1250,14 @@ def cmd_users(args: argparse.Namespace, creds: Creds) -> int:
 
 
 def cmd_groups(args: argparse.Namespace, creds: Creds) -> int:
-    section("Group enumeration (SMB --groups)")
+    # netexec moved --groups off the smb protocol onto ldap, so query there.
+    section("Group enumeration (LDAP --groups)")
     nxc = require_netexec()
     if not nxc:
         return 1
-    code, out = run(_nxc_base(nxc, creds) + ["--groups"], args.dry_run)
-    if not args.dry_run and out.strip():
-        REPORT.add_f(
-            "Groups", Sev.INFO, "Group enumeration via SMB completed",
-            explanation="Cross-reference privileged group membership with your user list.",
-            ref=REFS["general"],
-        )
+    code, out = run(_nxc_base(nxc, creds, "ldap") + ["--groups"], args.dry_run)
+    if not args.dry_run:
+        parse_grouplist(out)
     return code
 
 
@@ -1639,7 +1670,7 @@ examples:
     specs = [
         ("check", "Validate credentials against the DC (SMB)", cmd_check),
         ("users", "Enumerate domain users (SMB, works with null/guest)", cmd_users),
-        ("groups", "Enumerate domain groups (SMB)", cmd_groups),
+        ("groups", "Enumerate domain groups (LDAP)", cmd_groups),
         ("shares", "Enumerate SMB shares and permissions", cmd_shares),
         ("pass-pol", "Dump the domain password policy (SMB)", cmd_passpol),
         ("rid-brute", "Brute force RIDs to enumerate objects (SMB)", cmd_ridbrute),
